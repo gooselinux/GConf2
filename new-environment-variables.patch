@@ -1,0 +1,188 @@
+From a7fe72cf365ccf453e92c990b608c04e501b9494 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Mon, 22 Mar 2010 21:59:44 -0400
+Subject: [PATCH 1/2] Add GCONF_SYNC_INTERVAL environment variable
+
+This allows administrators to disable auto sync
+behavior or change the frequency on which syncing
+happens.
+---
+ gconf/gconf-database.c |   32 +++++++++++++++++++++++---------
+ gconf/gconf-database.h |    4 ++++
+ gconf/gconf.c          |    6 ++++++
+ 3 files changed, 33 insertions(+), 9 deletions(-)
+
+diff --git a/gconf/gconf-database.c b/gconf/gconf-database.c
+index 7ce2cc0..6082497 100644
+--- a/gconf/gconf-database.c
++++ b/gconf/gconf-database.c
+@@ -822,9 +822,15 @@ gconf_database_new (GConfSources  *sources)
+ 
+   db->sync_idle = 0;
+   db->sync_timeout = 0;
++  db->needs_sync = FALSE;
+ 
+   db->persistent_name = NULL;
+-  
++
++  if (g_getenv ("GCONF_SYNC_INTERVAL") != NULL)
++    db->sync_interval = atoi (g_getenv ("GCONF_SYNC_INTERVAL"));
++  else
++    db->sync_interval = 60;
++
+   return db;
+ }
+ 
+@@ -856,25 +862,21 @@ gconf_database_free (GConfDatabase *db)
+   
+   if (db->listeners != NULL)
+     {
+-      gboolean need_sync = FALSE;
+-      
+       g_assert(db->sources != NULL);
+ 
+       if (db->sync_idle != 0)
+         {
+           g_source_remove(db->sync_idle);
+           db->sync_idle = 0;
+-          need_sync = TRUE;
+         }
+ 
+       if (db->sync_timeout != 0)
+         {
+           g_source_remove(db->sync_timeout);
+           db->sync_timeout = 0;
+-          need_sync = TRUE;
+         }
+ 
+-      if (need_sync)
++      if (db->needs_sync)
+         gconf_database_really_sync(db);
+       
+       gconf_listeners_free(db->listeners);
+@@ -956,6 +958,8 @@ gconf_database_sync_timeout(GConfDatabase* db)
+   if (db->sync_idle == 0)
+     db->sync_idle = g_idle_add((GSourceFunc)gconf_database_sync_idle, db);
+ 
++  db->needs_sync = TRUE;
++
+   gconf_log(GCL_DEBUG, "Sync queued one minute after changes occurred");
+   
+   /* Remove the timeout function by returning FALSE */
+@@ -995,7 +999,10 @@ gconf_database_sync_nowish(GConfDatabase* db)
+ 
+   /* Schedule immediate post-quietdown sync */
+   if (db->sync_idle == 0)
+-    db->sync_idle = g_idle_add((GSourceFunc)gconf_database_sync_idle, db);
++    {
++      db->sync_idle = g_idle_add((GSourceFunc)gconf_database_sync_idle, db);
++      db->needs_sync = TRUE;
++    }
+ }
+ 
+ static void
+@@ -1006,10 +1013,16 @@ gconf_database_schedule_sync(GConfDatabase* db)
+     return;
+   else if (db->sync_timeout != 0)
+     return;
++  else if (db->sync_interval <= 0)
++    {
++      db->needs_sync = TRUE;
++      return;
++    }
+   else
+     {
+-      /* 1 minute timeout */
+-      db->sync_timeout = g_timeout_add_seconds(60, (GSourceFunc)gconf_database_sync_timeout, db);
++      /* 1 minute timeout by default */
++      db->sync_timeout = g_timeout_add_seconds(db->sync_interval, (GSourceFunc)gconf_database_sync_timeout, db);
++      db->needs_sync = TRUE;
+     }
+ }
+ 
+@@ -1707,6 +1720,7 @@ gconf_database_synchronous_sync (GConfDatabase  *db,
+     }
+ 
+   db->last_access = time(NULL);
++  db->needs_sync = FALSE;
+   
+   return gconf_sources_sync_all(db->sources, err);
+ }
+diff --git a/gconf/gconf-database.h b/gconf/gconf-database.h
+index 604b819..163c376 100644
+--- a/gconf/gconf-database.h
++++ b/gconf/gconf-database.h
+@@ -48,6 +48,10 @@ struct _GConfDatabase
+   guint sync_timeout;
+ 
+   gchar *persistent_name;
++
++  int   sync_interval;
++
++  guint32   needs_sync : 1;
+ };
+ 
+ GConfDatabase* gconf_database_new     (GConfSources  *sources);
+diff --git a/gconf/gconf.c b/gconf/gconf.c
+index 4261524..57eab0f 100644
+--- a/gconf/gconf.c
++++ b/gconf/gconf.c
+@@ -1885,6 +1885,12 @@ gconf_engine_suggest_sync(GConfEngine* conf, GError** err)
+ 
+   CHECK_OWNER_USE (conf);
+   
++  if (g_getenv ("GCONF_SYNC_INTERVAL") != NULL &&
++      atoi (g_getenv ("GCONF_SYNC_INTERVAL")) <= 0)
++    {
++      return;
++    }
++
+   if (gconf_engine_is_local(conf))
+     {
+       GError* error = NULL;
+-- 
+1.6.5.2
+
+
+From f7dacbd87240df444d89c8e6873e108756e5707d Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Mon, 22 Mar 2010 22:06:53 -0400
+Subject: [PATCH 2/2] add GCONF_PERSIST_UNTIL_SESSION_EXITS environment variable
+
+This variable allows adminstrators to prevent gconfd from
+shutting down while the session is active.  Normally, gconfd
+will shutdown after 30 seconds of inactivity.
+---
+ gconf/gconfd.c |   16 +++++++++++++---
+ 1 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/gconf/gconfd.c b/gconf/gconfd.c
+index 38a8423..3008f1e 100644
+--- a/gconf/gconfd.c
++++ b/gconf/gconfd.c
+@@ -975,9 +975,19 @@ periodic_cleanup_timeout(gpointer data)
+ 
+   if (no_databases_in_use () && client_count () == 0)
+     {
+-      gconf_log (GCL_INFO, _("GConf server is not in use, shutting down."));
+-      gconf_main_quit ();
+-      return FALSE;
++      gboolean should_persist;
++
++      if (g_getenv ("GCONF_PERSIST_UNTIL_SESSION_EXITS") != NULL)
++        should_persist = atoi (g_getenv ("GCONF_PERSIST_UNTIL_SESSION_EXITS"));
++      else
++        should_persist = FALSE;
++
++      if (!should_persist)
++        {
++          gconf_log (GCL_INFO, _("GConf server is not in use, shutting down."));
++          gconf_main_quit ();
++          return FALSE;
++        }
+     }
+   
+   /* expire old locale cache entries */
+-- 
+1.6.5.2
+
